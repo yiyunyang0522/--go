@@ -1,1 +1,103 @@
+name: Horizon Monitor
 
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      since_days:
+        description: 'Lookback window in days'
+        required: false
+        default: '180'
+      reset_state:
+        description: 'Clear seen-state and re-flag everything'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore seen-state cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.horizon_monitor
+          key: horizon-state-${{ github.run_id }}
+          restore-keys: |
+            horizon-state-
+
+      - name: Restore seen-state from repo (fallback)
+        run: |
+          mkdir -p ~/.horizon_monitor
+          if [ -f state/seen.json ] && [ ! -f ~/.horizon_monitor/seen.json ]; then
+            cp state/seen.json ~/.horizon_monitor/seen.json
+            echo "Restored seen.json from committed state/"
+          fi
+
+      - name: Run connectivity test
+        run: python horizon_monitor.py --test
+
+      - name: Run monitor
+        run: |
+          ARGS="--since ${{ github.event.inputs.since_days || '180' }} --json"
+          if [ "${{ github.event.inputs.reset_state }}" = "true" ]; then
+            ARGS="$ARGS --reset"
+          fi
+          python horizon_monitor.py $ARGS
+
+      - name: Commit digest and state
+        run: |
+          mkdir -p state
+          if [ -f ~/.horizon_monitor/seen.json ]; then
+            cp ~/.horizon_monitor/seen.json state/seen.json
+          fi
+          mkdir -p runs
+          DATE=$(date -u +"%Y-%m-%d")
+          if [ -f digest.md ]; then
+            cp digest.md "runs/digest-${DATE}.md"
+          fi
+          if [ -f digest.json ]; then
+            cp digest.json "runs/digest-${DATE}.json"
+          fi
+          git config user.name "horizon-monitor-bot"
+          git config user.email "actions@github.com"
+          git add digest.md digest.json runs/ state/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "monitor: run ${DATE}"
+            git push
+          fi
+
+      - name: Upload digest as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: digest-${{ github.run_id }}
+          path: |
+            digest.md
+            digest.json
+          retention-days: 90
