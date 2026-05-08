@@ -168,45 +168,110 @@ def fetch_hkex(since_days: int = 365, lang: str = "EN") -> list[Item]:
         # Some responses come wrapped in callback paren — strip if so
         if text.startswith("(") and text.endswith(")"):
             text = text[1:-1]
-        data = json.loads(text)
 
-        # The JSON structure has been observed as:
-        # [{ "DATE_TIME": "DD/MM/YYYY HH:MM",
-        #    "FILE_LINK": "/listedco/listconews/sehk/.../xxx.pdf",
-        #    "TITLE": "...",
-        #    "LONG_TEXT": "Category - Subcategory",
-        #    ... }, ...]
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            # If it's not JSON, dump the first 500 chars so we can see what it is
+            print(f"  [HKEX] response is not JSON. First 500 chars:", file=sys.stderr)
+            print(f"  {text[:500]}", file=sys.stderr)
+            return items
+
+        # Unwrap dict if response is wrapped (e.g., {"result": [...]})
         if isinstance(data, dict):
-            data = data.get("result", data.get("data", []))
+            for key in ("result", "data", "results", "items", "records"):
+                if key in data and isinstance(data[key], list):
+                    data = data[key]
+                    break
+            else:
+                # Single dict with no list field — log and bail
+                print(f"  [HKEX] unexpected dict response, keys: {list(data.keys())}",
+                      file=sys.stderr)
+                return items
 
-        for entry in data:
-            title = (entry.get("TITLE") or "").strip()
-            file_link = (entry.get("FILE_LINK") or "").strip()
-            full_url = urljoin("https://www1.hkexnews.hk", file_link) if file_link else ""
-            cat = (entry.get("LONG_TEXT") or "").strip()
-            date_raw = (entry.get("DATE_TIME") or "").strip()
+        if not isinstance(data, list):
+            print(f"  [HKEX] expected list, got {type(data).__name__}", file=sys.stderr)
+            return items
 
+        # Multiple field-name conventions HKEX has used over the years:
+        title_keys     = ["TITLE", "title", "DOC_TITLE", "doc_title", "newsTitle"]
+        file_keys      = ["FILE_LINK", "file_link", "fileLink", "DOC_LINK", "doc_link"]
+        category_keys  = ["LONG_TEXT", "long_text", "longText", "CATEGORY", "category", "headLine"]
+        date_keys      = ["DATE_TIME", "date_time", "dateTime", "DATETIME", "RELEASE_TIME", "releaseTime"]
+
+        def get_field(entry: dict, candidates: list[str]) -> str:
+            """Try each candidate key; return first non-empty value."""
+            for k in candidates:
+                if k in entry and entry[k]:
+                    return str(entry[k]).strip()
+            return ""
+
+        skipped = 0
+        for i, entry in enumerate(data):
             try:
-                # HKEX format: '12/06/2025 19:01'
-                date_iso = dt.datetime.strptime(date_raw, "%d/%m/%Y %H:%M").isoformat()
-            except ValueError:
+                # Skip non-dict entries (the original bug — sometimes this is a string)
+                if not isinstance(entry, dict):
+                    if i == 0:  # log shape on first occurrence
+                        print(f"  [HKEX] entry not a dict, got {type(entry).__name__}: "
+                              f"{str(entry)[:120]}", file=sys.stderr)
+                    skipped += 1
+                    continue
+
+                title = get_field(entry, title_keys)
+                file_link = get_field(entry, file_keys)
+                cat = get_field(entry, category_keys)
+                date_raw = get_field(entry, date_keys)
+
+                # Skip entries with no title (probably a header row or filter)
+                if not title:
+                    skipped += 1
+                    continue
+
+                full_url = urljoin("https://www1.hkexnews.hk", file_link) if file_link else ""
+
+                # Try several date formats
                 date_iso = date_raw
+                for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S",
+                            "%Y-%m-%d %H:%M", "%d/%m/%Y", "%Y%m%d"):
+                    try:
+                        date_iso = dt.datetime.strptime(date_raw, fmt).isoformat()
+                        break
+                    except ValueError:
+                        continue
 
-            score, tags = score_hkex(title, cat)
-            items.append(Item(
-                source="HKEX",
-                category=cat,
-                date=date_iso,
-                title=title,
-                url=full_url,
-                summary="",
-                importance=score,
-                tags=tags,
-            ))
+                score, tags = score_hkex(title, cat)
+                items.append(Item(
+                    source="HKEX",
+                    category=cat,
+                    date=date_iso,
+                    title=title,
+                    url=full_url,
+                    summary="",
+                    importance=score,
+                    tags=tags,
+                ))
+            except Exception as e:
+                # Don't let a single bad entry kill the whole batch
+                print(f"  [HKEX] entry {i} parse error ({type(e).__name__}): {e}",
+                      file=sys.stderr)
+                skipped += 1
 
-    except (requests.RequestException, json.JSONDecodeError) as e:
+        if skipped > 0:
+            print(f"  [HKEX] skipped {skipped} entries (no title or parse error)",
+                  file=sys.stderr)
+
+        if not items and data:
+            # We got data back but couldn't parse any of it — dump shape for diagnosis
+            sample = data[0] if data else None
+            print(f"  [HKEX] could not parse any entry. First entry shape:",
+                  file=sys.stderr)
+            print(f"  type={type(sample).__name__}  preview={str(sample)[:300]}",
+                  file=sys.stderr)
+            if isinstance(sample, dict):
+                print(f"  keys={list(sample.keys())}", file=sys.stderr)
+
+    except requests.RequestException as e:
         print(f"  [HKEX] fetch failed: {type(e).__name__}: {e}", file=sys.stderr)
-        # Fallback: try the chinese version since Horizon files in Chinese
         if lang == "EN":
             print("  [HKEX] retrying with Chinese...", file=sys.stderr)
             return fetch_hkex(since_days=since_days, lang="ZH")
@@ -646,9 +711,19 @@ def cmd_run(args) -> int:
 
     all_items: list[Item] = []
 
+    def _safe_fetch(label: str, fn, *fargs, **fkwargs) -> list[Item]:
+        """Call a fetch function, log any uncaught error, return [] on failure."""
+        try:
+            return fn(*fargs, **fkwargs)
+        except Exception as e:
+            print(f"  [{label}] CRASHED ({type(e).__name__}): {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return []
+
     if not args.no_hkex:
         print("[1] HKEX 披露…")
-        items = fetch_hkex(since_days=args.since)
+        items = _safe_fetch("HKEX", fetch_hkex, since_days=args.since)
         print(f"    → {len(items)} 条")
         all_items.extend(items)
         time.sleep(1)
@@ -657,7 +732,7 @@ def cmd_run(args) -> int:
         print("[2] 华尔街见闻…")
         wscn_items: list[Item] = []
         for kw in ["地平线机器人", "9660.HK", "Horizon Robotics"]:
-            chunk = fetch_wallstreetcn(keyword=kw, limit=20)
+            chunk = _safe_fetch("WSCN", fetch_wallstreetcn, keyword=kw, limit=20)
             wscn_items.extend(chunk)
             time.sleep(1.2)
         wscn_items = _dedupe(wscn_items)
@@ -665,13 +740,15 @@ def cmd_run(args) -> int:
         all_items.extend(wscn_items)
 
         print("[3] 财新网…")
-        cx = fetch_via_ddg("caixin.com", ["地平线机器人", "9660.HK"], "CAIXIN", limit=10)
+        cx = _safe_fetch("CAIXIN", fetch_via_ddg,
+                         "caixin.com", ["地平线机器人", "9660.HK"], "CAIXIN", limit=10)
         print(f"    → {len(cx)} 条")
         all_items.extend(cx)
         time.sleep(2)
 
         print("[4] 36氪…")
-        kr = fetch_via_ddg("36kr.com", ["地平线机器人"], "36KR", limit=10)
+        kr = _safe_fetch("36KR", fetch_via_ddg,
+                         "36kr.com", ["地平线机器人"], "36KR", limit=10)
         print(f"    → {len(kr)} 条")
         all_items.extend(kr)
 
