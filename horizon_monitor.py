@@ -104,6 +104,431 @@ class Item:
 
 
 # ============================================================
+# KPI TRACKING - 核心财务指标跟踪
+# ============================================================
+#
+# This module tracks the financial KPIs that matter most for thesis validation:
+#
+#   1. Gross Margin (overall) - the headline figure
+#   2. Gross Margin - Hardware (Product Solutions) - the most-watched
+#   3. Gross Margin - Software (License & Services) - moat indicator
+#   4. High-end shipment mix % - drives ASP uplift
+#   5. R&D as % of revenue - operating leverage signal
+#   6. Revenue YoY growth
+#   7. Adjusted operating loss (excludes fair value of preferred shares)
+#
+# The baseline is hardcoded with FY2025 actuals. After each new H1/annual
+# report, run `python3 horizon_monitor.py kpi update` to enter new numbers
+# interactively. The script compares to baseline and flags any KPI that
+# crosses a warning threshold.
+
+# Baseline KPI snapshot - update after each new report
+# Last updated: 2026-03 (FY2025 annual report)
+KPI_BASELINE = {
+    "as_of": "2025FY",
+    "report_date": "2026-03-19",
+    "report_url": "https://stockn.xueqiu.com/09660/20260319282482.pdf",
+    # Income statement
+    "revenue_cny_mm": 3758,
+    "revenue_yoy": 0.577,
+    "gm_overall": 0.645,       # 综合毛利率
+    "gm_hardware": 0.345,      # 汽车产品方案毛利率 - 硬件
+    "gm_software": 0.93,       # 汽车授权服务毛利率 - 软件
+    "gm_nonauto": 0.50,        # 非汽车业务毛利率（估算）
+    "rd_pct_revenue": 1.371,   # 研发费用率 137.1%
+    "adj_op_loss_cny_mm": -2372,
+    # Volume / mix
+    "shipments_units_mm": 4.01,           # 全年出货 401 万套
+    "highend_mix": 0.45,                  # 中高阶占比
+    "highend_shipments_units_mm": 1.80,   # 中高阶 180 万套
+    "cumulative_shipments_units_mm": 11.7,  # 累计 1170 万套
+    # Mix
+    "revenue_mix_product": 0.43,          # 硬件占比
+    "revenue_mix_license": 0.52,          # 软件占比
+    "revenue_mix_nonauto": 0.05,
+    # Market share (China自主品牌)
+    "market_share_l2_adas": 0.477,        # L2 ADAS 市占率
+    "market_share_city_noa": 0.144,       # 城区 NOA 市占率
+    # HSD
+    "hsd_design_wins": 20,                # HSD 累计定点车型数
+    "hsd_deployed_units": 22000,          # HSD 上市后已交付套数
+}
+
+# Health thresholds - what's a healthy / warning / danger reading
+# Each tuple: (healthy_value, danger_value, direction)
+#   direction = "higher_better" or "lower_better"
+#
+# CRITICAL: GM thresholds calibrated to current trajectory.
+# Hardware GM is THE most-watched metric per analysis of FY2025 report.
+KPI_THRESHOLDS = {
+    "gm_overall":         (0.65,  0.55,  "higher_better"),  # 综合毛利率
+    "gm_hardware":        (0.38,  0.28,  "higher_better"),  # 硬件毛利率 (key tracker)
+    "gm_software":        (0.92,  0.85,  "higher_better"),  # 软件毛利率 (moat)
+    "revenue_yoy":        (0.50,  0.25,  "higher_better"),  # 营收增速
+    "highend_mix":        (0.55,  0.40,  "higher_better"),  # 中高阶占比
+    "rd_pct_revenue":     (1.00,  1.50,  "lower_better"),   # R&D 费率（降才好）
+    "market_share_l2_adas":  (0.45,  0.35,  "higher_better"),
+    "market_share_city_noa": (0.18,  0.10,  "higher_better"),
+}
+
+KPI_LABELS = {
+    "gm_overall":            "综合毛利率",
+    "gm_hardware":           "硬件 GM (汽车产品方案)",
+    "gm_software":           "软件 GM (汽车授权服务)",
+    "revenue_yoy":           "营收同比增速",
+    "highend_mix":           "中高阶出货占比",
+    "rd_pct_revenue":        "研发费用率",
+    "market_share_l2_adas":  "L2 ADAS 市占率 (自主)",
+    "market_share_city_noa": "城区 NOA 市占率 (自主)",
+}
+
+KPI_BASELINE_FILE = STATE_DIR / "kpi_baseline.json"
+KPI_HISTORY_FILE = STATE_DIR / "kpi_history.json"
+
+
+def load_kpi_baseline() -> dict:
+    """Load saved KPI baseline if exists, else return hardcoded default."""
+    if KPI_BASELINE_FILE.exists():
+        try:
+            return json.loads(KPI_BASELINE_FILE.read_text())
+        except json.JSONDecodeError:
+            pass
+    return dict(KPI_BASELINE)
+
+
+def save_kpi_baseline(kpi: dict) -> None:
+    STATE_DIR.mkdir(exist_ok=True)
+    KPI_BASELINE_FILE.write_text(json.dumps(kpi, indent=2, ensure_ascii=False))
+
+
+def load_kpi_history() -> list:
+    if KPI_HISTORY_FILE.exists():
+        try:
+            return json.loads(KPI_HISTORY_FILE.read_text())
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def append_kpi_history(kpi: dict) -> None:
+    STATE_DIR.mkdir(exist_ok=True)
+    history = load_kpi_history()
+    history.append(kpi)
+    KPI_HISTORY_FILE.write_text(json.dumps(history, indent=2, ensure_ascii=False))
+
+
+def score_kpi(value, healthy: float, danger: float, direction: str) -> str:
+    """Return status: GREEN / YELLOW / RED based on value vs thresholds."""
+    if value is None:
+        return "GRAY"
+    if direction == "higher_better":
+        if value >= healthy:
+            return "GREEN"
+        if value <= danger:
+            return "RED"
+        return "YELLOW"
+    else:  # lower_better
+        if value <= healthy:
+            return "GREEN"
+        if value >= danger:
+            return "RED"
+        return "YELLOW"
+
+
+# ============================================================
+# KPI SIGNAL EXTRACTION FROM NEWS
+# ============================================================
+#
+# Scan news titles + summaries for mentions of key KPIs.
+# We're NOT extracting numbers (too unreliable from short snippets).
+# Instead, we flag articles likely to update our KPI view.
+
+GM_KEYWORDS = [
+    # Chinese
+    "毛利率", "毛利", "gross margin", "gm", "毛利率下滑", "毛利率提升",
+    "硬件毛利", "软件毛利", "产品毛利", "授权毛利",
+    "结构性下滑", "业务组合", "收入组合",
+    # English
+    "gross margin", "margin compression", "margin expansion", "blended margin",
+]
+
+VOLUME_KEYWORDS = [
+    "出货量", "出货", "shipments", "交付量", "累计出货",
+    "中高阶", "中高端", "high-end", "high end", "高阶占比",
+    "ASP", "单价", "平均售价", "average system price",
+]
+
+OPEX_KEYWORDS = [
+    "研发费用", "研发投入", "R&D", "费用率", "运营杠杆",
+    "管理费用", "销售费用", "operating expense",
+]
+
+
+def extract_kpi_signals(items: list[Item]) -> dict:
+    """
+    Scan recent news for mentions of KPI-relevant keywords.
+    Returns a dict of {kpi_category: [matching items]}.
+    """
+    signals = {
+        "gross_margin": [],
+        "volume_asp":   [],
+        "opex":         [],
+    }
+    for item in items:
+        text = f"{item.title} {item.summary}".lower()
+        if any(k.lower() in text for k in GM_KEYWORDS):
+            signals["gross_margin"].append(item)
+        if any(k.lower() in text for k in VOLUME_KEYWORDS):
+            signals["volume_asp"].append(item)
+        if any(k.lower() in text for k in OPEX_KEYWORDS):
+            signals["opex"].append(item)
+    return signals
+
+
+def render_kpi_dashboard(path: str = "kpi_dashboard.md") -> None:
+    """Write the KPI dashboard markdown file."""
+    kpi = load_kpi_baseline()
+    history = load_kpi_history()
+
+    lines: list[str] = []
+    lines.append("# 地平线 (9660.HK) KPI 跟踪仪表盘")
+    lines.append("")
+    lines.append(f"**基线快照**: {kpi.get('as_of', '?')}　|　"
+                 f"**报告日期**: {kpi.get('report_date', '?')}　|　"
+                 f"**已记录历史**: {len(history)} 期")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 核心健康度指标")
+    lines.append("")
+    lines.append("| 指标 | 最新值 | 健康线 | 警戒线 | 状态 |")
+    lines.append("|---|---:|---:|---:|:---:|")
+
+    status_emoji = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴", "GRAY": "⚪"}
+    for key, (healthy, danger, direction) in KPI_THRESHOLDS.items():
+        value = kpi.get(key)
+        label = KPI_LABELS.get(key, key)
+        status = score_kpi(value, healthy, danger, direction)
+        emoji = status_emoji[status]
+
+        def fmt(v):
+            if v is None:
+                return "—"
+            return f"{v*100:.1f}%" if abs(v) < 5 else f"{v:.1f}"
+
+        lines.append(f"| {label} | {fmt(value)} | {fmt(healthy)} | "
+                     f"{fmt(danger)} | {emoji} {status} |")
+
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 毛利率结构 (核心关注点)")
+    lines.append("")
+    gm_o = kpi.get("gm_overall")
+    gm_h = kpi.get("gm_hardware")
+    gm_s = kpi.get("gm_software")
+    mix_p = kpi.get("revenue_mix_product")
+    mix_l = kpi.get("revenue_mix_license")
+
+    if all(v is not None for v in [gm_o, gm_h, gm_s, mix_p, mix_l]):
+        lines.append(f"- **综合毛利率**: {gm_o*100:.1f}%")
+        lines.append(f"- **硬件业务** (占营收 {mix_p*100:.0f}%): GM = {gm_h*100:.1f}%　← 关键跟踪")
+        lines.append(f"- **软件业务** (占营收 {mix_l*100:.0f}%): GM = {gm_s*100:.1f}%　← 护城河")
+        lines.append("")
+
+        # Diagnostic
+        spread = gm_s - gm_h
+        lines.append(f"软件 vs 硬件 GM 差: **{spread*100:.0f}pp** "
+                     f"(差异越大, 业务结构变化对综合 GM 影响越大)")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    lines.append("## 历史趋势")
+    lines.append("")
+    if not history:
+        lines.append("> 尚无历史快照。运行 `python3 horizon_monitor.py kpi update` 录入新报告数据后, 历史会自动累积。")
+    else:
+        lines.append("| 期间 | 综合 GM | 硬件 GM | 软件 GM | 高端占比 | 营收 YoY |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        for snap in history[-10:]:  # last 10
+            period = snap.get("as_of", "?")
+            def f(v):
+                return f"{v*100:.1f}%" if isinstance(v, (int, float)) else "—"
+            lines.append(f"| {period} | {f(snap.get('gm_overall'))} | "
+                         f"{f(snap.get('gm_hardware'))} | {f(snap.get('gm_software'))} | "
+                         f"{f(snap.get('highend_mix'))} | {f(snap.get('revenue_yoy'))} |")
+
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 操作说明")
+    lines.append("")
+    lines.append("- 新半年报/年报披露后, 运行 `python3 horizon_monitor.py kpi update`")
+    lines.append("- 查看当前基线: `python3 horizon_monitor.py kpi show`")
+    lines.append("- 重置基线: 删除 `~/.horizon_monitor/kpi_baseline.json`")
+    lines.append("")
+    lines.append(f"_报告原文_: [{kpi.get('report_url', '')}]({kpi.get('report_url', '')})")
+
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+def cmd_kpi_show() -> int:
+    """Print current KPI baseline."""
+    kpi = load_kpi_baseline()
+    print(f"\n=== Current KPI Baseline ({kpi.get('as_of', '?')}) ===\n")
+    for key, label in KPI_LABELS.items():
+        value = kpi.get(key)
+        if value is None:
+            print(f"  {label:<32} : —")
+        elif abs(value) < 5:
+            print(f"  {label:<32} : {value*100:.2f}%")
+        else:
+            print(f"  {label:<32} : {value:,.2f}")
+
+    print("\n=== Health Status ===\n")
+    for key, (healthy, danger, direction) in KPI_THRESHOLDS.items():
+        value = kpi.get(key)
+        label = KPI_LABELS.get(key, key)
+        status = score_kpi(value, healthy, danger, direction)
+        marker = {"GREEN": "✓", "YELLOW": "!", "RED": "✗", "GRAY": "?"}[status]
+        print(f"  [{marker}] {label:<32} : {status}")
+    print()
+    return 0
+
+
+def cmd_kpi_update() -> int:
+    """Interactive KPI input. Prompts user for each field."""
+    print("\n=== KPI Update - 录入新报告数据 ===")
+    print("Enter new values (press Enter to keep current baseline value)\n")
+
+    current = load_kpi_baseline()
+    new_kpi = dict(current)
+
+    def prompt(key: str, label: str, is_pct: bool = True):
+        cur = current.get(key)
+        if cur is None:
+            cur_str = "—"
+        elif is_pct and abs(cur) < 5:
+            cur_str = f"{cur*100:.2f}%"
+        else:
+            cur_str = f"{cur:,.2f}"
+        s = input(f"  {label} [{cur_str}]: ").strip()
+        if not s:
+            return cur
+        try:
+            v = float(s.rstrip("%"))
+            if is_pct and "%" in s:
+                v = v / 100
+            elif is_pct and abs(v) > 5:  # likely entered as percent without %
+                print(f"    (interpreting {v} as {v}%)")
+                v = v / 100
+            return v
+        except ValueError:
+            print(f"    ⚠ Invalid input '{s}', keeping {cur_str}")
+            return cur
+
+    # Period meta
+    period = input(f"  报告期间 e.g. 2026H1 [{current.get('as_of')}]: ").strip()
+    if period:
+        new_kpi["as_of"] = period
+    report_date = input(f"  报告日期 YYYY-MM-DD [{current.get('report_date')}]: ").strip()
+    if report_date:
+        new_kpi["report_date"] = report_date
+    url = input(f"  报告 URL (可选): ").strip()
+    if url:
+        new_kpi["report_url"] = url
+
+    print("\n--- 收入与盈利 ---")
+    new_kpi["revenue_cny_mm"] = prompt("revenue_cny_mm", "营收 CNY mm", is_pct=False)
+    new_kpi["revenue_yoy"] = prompt("revenue_yoy", "营收同比")
+    new_kpi["gm_overall"] = prompt("gm_overall", "综合毛利率")
+    new_kpi["gm_hardware"] = prompt("gm_hardware", "硬件 GM (汽车产品方案)")
+    new_kpi["gm_software"] = prompt("gm_software", "软件 GM (汽车授权服务)")
+    new_kpi["rd_pct_revenue"] = prompt("rd_pct_revenue", "研发费用率")
+    new_kpi["adj_op_loss_cny_mm"] = prompt("adj_op_loss_cny_mm", "经调整经营亏损 CNY mm", is_pct=False)
+
+    print("\n--- 出货量 ---")
+    new_kpi["shipments_units_mm"] = prompt("shipments_units_mm", "出货量 百万套", is_pct=False)
+    new_kpi["highend_mix"] = prompt("highend_mix", "中高阶占比")
+    new_kpi["highend_shipments_units_mm"] = prompt("highend_shipments_units_mm", "中高阶出货 百万套", is_pct=False)
+
+    print("\n--- 业务结构 ---")
+    new_kpi["revenue_mix_product"] = prompt("revenue_mix_product", "硬件业务占营收")
+    new_kpi["revenue_mix_license"] = prompt("revenue_mix_license", "软件业务占营收")
+
+    print("\n--- 市占率 ---")
+    new_kpi["market_share_l2_adas"] = prompt("market_share_l2_adas", "L2 ADAS 市占率")
+    new_kpi["market_share_city_noa"] = prompt("market_share_city_noa", "城区 NOA 市占率")
+
+    # Diff before save
+    print("\n=== 变动概览 ===")
+    changes = []
+    for key in KPI_THRESHOLDS:
+        old = current.get(key)
+        new = new_kpi.get(key)
+        if old is not None and new is not None and old != new:
+            delta = new - old
+            label = KPI_LABELS.get(key, key)
+            if abs(old) < 5:
+                changes.append(f"  {label}: {old*100:.1f}% → {new*100:.1f}%  "
+                               f"({'↑' if delta > 0 else '↓'}{abs(delta)*100:.1f}pp)")
+            else:
+                changes.append(f"  {label}: {old:.2f} → {new:.2f}  "
+                               f"({'↑' if delta > 0 else '↓'}{abs(delta):.2f})")
+    if changes:
+        for c in changes:
+            print(c)
+    else:
+        print("  (no changes)")
+
+    print()
+    confirm = input("保存？ (y/n): ").strip().lower()
+    if confirm != "y":
+        print("已取消")
+        return 1
+
+    # Save old baseline to history first
+    append_kpi_history(current)
+    save_kpi_baseline(new_kpi)
+
+    # Now compare to new thresholds and warn
+    print("\n=== 新基线健康状态 ===")
+    warnings_found = []
+    for key, (healthy, danger, direction) in KPI_THRESHOLDS.items():
+        value = new_kpi.get(key)
+        old_value = current.get(key)
+        label = KPI_LABELS.get(key, key)
+        status = score_kpi(value, healthy, danger, direction)
+        old_status = score_kpi(old_value, healthy, danger, direction)
+
+        marker = {"GREEN": "✓", "YELLOW": "!", "RED": "✗", "GRAY": "?"}[status]
+        change = ""
+        if status != old_status:
+            change = f"  ← was {old_status}"
+            if status == "RED" or (status == "YELLOW" and old_status == "GREEN"):
+                warnings_found.append(label)
+        print(f"  [{marker}] {label:<32} : {status}{change}")
+
+    if warnings_found:
+        print("\n⚠ 以下指标恶化, 建议重新审视投资逻辑:")
+        for w in warnings_found:
+            print(f"    - {w}")
+
+    print(f"\n✓ 基线已更新, 旧基线归档到历史 (共 {len(load_kpi_history())} 期)")
+    print(f"✓ 运行 `python3 horizon_monitor.py kpi dashboard` 生成最新仪表盘")
+    return 0
+
+
+def cmd_kpi_dashboard(args) -> int:
+    """Generate the KPI dashboard markdown file."""
+    path = getattr(args, 'out_kpi', None) or "kpi_dashboard.md"
+    render_kpi_dashboard(path)
+    print(f"✓ KPI dashboard written to {path}")
+    return 0
+
+
+# ============================================================
 # STATE PERSISTENCE
 # ============================================================
 
@@ -507,10 +932,15 @@ def score_news(title: str, summary: str = "") -> tuple[int, list[str]]:
     text = f"{title} {summary}".lower()
     tags: list[str] = []
 
-    # 5 — material event
+    # 5 — material event (earnings, gross margin specifically, etc.)
+    # NOTE: 毛利率 elevated to importance 5 because it's our core tracker.
+    # Mentions of "毛利率下滑", "硬件毛利", etc. are MUST-READs.
     high5 = {
         "财报": "earnings", "业绩": "earnings", "营收": "earnings", "亏损": "earnings",
-        "盈利": "earnings", "利润": "earnings", "毛利": "earnings",
+        "盈利": "earnings", "利润": "earnings",
+        "毛利率": "gross_margin", "毛利": "gross_margin",
+        "gross margin": "gross_margin", "硬件毛利": "gross_margin_hw",
+        "软件毛利": "gross_margin_sw", "毛利率下滑": "gm_decline",
         "停牌": "trading", "复牌": "trading",
         "重大": "material",
         "earnings": "earnings", "revenue": "earnings", "loss": "earnings",
@@ -531,6 +961,10 @@ def score_news(title: str, summary: str = "") -> tuple[int, list[str]]:
         "HSD": "hsd", "城区": "city_noa", "NOA": "noa",
         "J6": "chip", "征程": "chip", "Journey": "chip",
         "大众": "vw", "Volkswagen": "vw", "酷睿程": "vw", "CARIZON": "vw",
+        # NEW: KPI-relevant secondary signals
+        "中高阶": "highend_mix", "占比": "mix_signal",
+        "ASP": "asp", "单价": "asp", "平均售价": "asp",
+        "研发费用": "rd_spend", "费用率": "opex_ratio",
     }
     for k, t in high4.items():
         if k in text:
@@ -570,6 +1004,47 @@ def write_digest(new_items: list[Item], all_items: list[Item],
     if by_source:
         breakdown = "　".join(f"{s}:{c}" for s, c in by_source.items())
         lines.append(f"**来源分布**: {breakdown}")
+    lines.append("")
+
+    # === KPI SIGNAL BANNER ===
+    # Highlight any new items that touch our core KPIs (gross margin, etc.)
+    signals = extract_kpi_signals(new_items)
+    if any(signals.values()):
+        lines.append("## ⚡ KPI 信号警报")
+        lines.append("")
+        if signals["gross_margin"]:
+            lines.append(f"**🔴 毛利率相关**: {len(signals['gross_margin'])} 条 - "
+                         "建议检查是否需要更新 KPI 基线 (`kpi update`)")
+            for it in signals["gross_margin"][:3]:
+                lines.append(f"  - [{it.title}]({it.url})")
+        if signals["volume_asp"]:
+            lines.append(f"**🟠 出货量/ASP**: {len(signals['volume_asp'])} 条")
+            for it in signals["volume_asp"][:2]:
+                lines.append(f"  - [{it.title}]({it.url})")
+        if signals["opex"]:
+            lines.append(f"**🟡 费用结构**: {len(signals['opex'])} 条")
+            for it in signals["opex"][:2]:
+                lines.append(f"  - [{it.title}]({it.url})")
+        lines.append("")
+
+    # KPI baseline summary
+    kpi = load_kpi_baseline()
+    lines.append("## 📊 当前 KPI 基线")
+    lines.append("")
+    gm_o = kpi.get("gm_overall")
+    gm_h = kpi.get("gm_hardware")
+    gm_s = kpi.get("gm_software")
+    if all(v is not None for v in [gm_o, gm_h, gm_s]):
+        # Color code based on hardware GM (the key metric)
+        hw_healthy, hw_danger, _ = KPI_THRESHOLDS["gm_hardware"]
+        hw_status = score_kpi(gm_h, hw_healthy, hw_danger, "higher_better")
+        emoji = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴", "GRAY": "⚪"}[hw_status]
+        lines.append(f"基线期: **{kpi.get('as_of', '?')}**　|　"
+                     f"综合 GM: {gm_o*100:.1f}%　|　"
+                     f"{emoji} **硬件 GM: {gm_h*100:.1f}%** (关键)　|　"
+                     f"软件 GM: {gm_s*100:.1f}%")
+    lines.append("")
+    lines.append("> 详细 KPI 仪表盘见 `kpi_dashboard.md` (运行 `kpi dashboard` 更新)")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -793,13 +1268,18 @@ def _dedupe(items: list[Item]) -> list[Item]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Horizon Robotics 9660.HK 信息源监测",
+        description="Horizon Robotics 9660.HK 信息源监测 + KPI 跟踪",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Examples:\n"
+            "Examples (news/filings monitoring):\n"
             "  python3 horizon_monitor.py --test\n"
             "  python3 horizon_monitor.py --since 365 --json\n"
             "  python3 horizon_monitor.py --no-news --reset\n"
+            "\n"
+            "Examples (KPI tracking):\n"
+            "  python3 horizon_monitor.py kpi show           # 查看当前 KPI 基线\n"
+            "  python3 horizon_monitor.py kpi update         # 新财报后录入\n"
+            "  python3 horizon_monitor.py kpi dashboard      # 生成 kpi_dashboard.md\n"
         ),
     )
     ap.add_argument("--since", type=int, default=180,
@@ -812,13 +1292,42 @@ def main() -> int:
     ap.add_argument("--no-news", action="store_true", help="skip news sources")
     ap.add_argument("--out", default=DEFAULT_DIGEST,
                     help=f"digest output path (default: {DEFAULT_DIGEST})")
+    ap.add_argument("--out-kpi", default="kpi_dashboard.md",
+                    help="KPI dashboard output path (default: kpi_dashboard.md)")
     ap.add_argument("--test", action="store_true",
                     help="connectivity test only, no scraping")
+
+    # KPI subcommand (positional, optional)
+    ap.add_argument("kpi_cmd", nargs="?", default=None,
+                    choices=[None, "kpi"],
+                    help="run KPI subcommand (use 'kpi' followed by show/update/dashboard)")
+    ap.add_argument("kpi_action", nargs="?", default=None,
+                    choices=[None, "show", "update", "dashboard"],
+                    help="KPI action when kpi_cmd='kpi'")
+
     args = ap.parse_args()
+
+    # KPI subcommand dispatch
+    if args.kpi_cmd == "kpi":
+        if args.kpi_action == "show":
+            return cmd_kpi_show()
+        if args.kpi_action == "update":
+            return cmd_kpi_update()
+        if args.kpi_action == "dashboard":
+            return cmd_kpi_dashboard(args)
+        print("ERROR: kpi requires an action: show | update | dashboard", file=sys.stderr)
+        return 2
 
     if args.test:
         return cmd_test()
-    return cmd_run(args)
+    result = cmd_run(args)
+    # Also regenerate the KPI dashboard each run (so it stays fresh)
+    try:
+        render_kpi_dashboard(args.out_kpi)
+        print(f"[output] {args.out_kpi}")
+    except Exception as e:
+        print(f"[kpi-dashboard] failed: {e}", file=sys.stderr)
+    return result
 
 
 if __name__ == "__main__":
