@@ -1,34 +1,45 @@
 #!/usr/bin/env python3
 """
-Horizon Robotics (9660.HK) Disclosure & News Monitor
-======================================================
+Horizon Robotics (9660.HK) Disclosure & News Monitor v2
+========================================================
 
 Monitors reliable, high-signal sources for material information about
-Horizon Robotics (地平线机器人, HK:9660):
+Horizon Robotics (地平线机器人, HK:9660).
 
-  HKEX        - hkexnews.hk official disclosure portal (filings, announcements)
-  WSCN        - DuckDuckGo site search on wallstreetcn.com
-  Caixin      - DuckDuckGo site search on caixin.com
-  36Kr        - DuckDuckGo site search on 36kr.com
+TIER 1 — Official / Mandatory:
+  HKEX        - hkexnews.hk official disclosure portal
 
-EXPLICITLY EXCLUDED, with reasons:
-  Bloomberg   - paywall + ToS + near-zero Horizon-specific coverage
-  NYT         - paywall + zero Horizon-specific coverage
-  WSJ/Reuters - paywall + minimal coverage; whatever they publish is
-                typically picked up by WSCN or Caixin within hours
-  Xueqiu/Eastmoney/Forums - retail-investor noise, not "reliable"
+TIER 2 — High-signal Professional Media:
+  36Kr        - 36kr.com (tech/business, original reporting)
+  Sohu        - sohu.com (high-volume reprint hub, good aggregator)
+  Iyiou       - iyiou.com / 亿欧 (tech business, original reporting)
+
+TIER 3 — Supplementary:
+  QQ News     - news.qq.com (occasional in-depth coverage)
+  WSCN        - wallstreetcn.com (search indexing poor, low yield)
+  Caixin      - caixin.com (search indexing poor, low yield)
+
+NEW IN v2 — Source Reliability Scoring:
+  Each item now carries a `source_score` (1-5) rating how reliable
+  the source is for this specific piece of information.
+  The digest includes a "来源可靠性评估" section ranking sources.
+
+EXPLICITLY EXCLUDED:
+  Bloomberg/WSJ/Reuters - paywall + minimal Horizon coverage
+  Xueqiu/Eastmoney - retail-investor noise
+  Toutiao/Baijiahao - low-quality aggregation, duplicates Sohu coverage
 
 USAGE
-  python3 horizon_monitor.py                # full run, write digest.md
-  python3 horizon_monitor.py --since 365    # look back 365 days
-  python3 horizon_monitor.py --reset        # forget seen state
-  python3 horizon_monitor.py --json         # also emit digest.json
-  python3 horizon_monitor.py --no-news      # only HKEX filings
-  python3 horizon_monitor.py --test         # connectivity test, no writes
+  python3 horizon_monitor.py                 # full run, write digest.md
+  python3 horizon_monitor.py --since 365     # look back 365 days
+  python3 horizon_monitor.py --reset         # forget seen state
+  python3 horizon_monitor.py --json          # also emit digest.json
+  python3 horizon_monitor.py --no-news       # only HKEX filings
+  python3 horizon_monitor.py --test          # connectivity test only
+  python3 horizon_monitor.py --diagnose      # source reliability audit
 
 State (which items were already seen) is stored in
   ~/.horizon_monitor/seen.json
-so the next run only flags new items.
 
 DEPENDENCIES
   pip install requests beautifulsoup4 lxml duckduckgo_search
@@ -94,7 +105,7 @@ TIMEOUT = 25
 
 @dataclass
 class Item:
-    source: str          # 'HKEX' / 'WSCN' / 'CAIXIN' / '36KR'
+    source: str          # 'HKEX' / 'WSCN' / 'CAIXIN' / '36KR' / 'SOHU' / 'IYIOU' / 'QQNEWS'
     category: str        # source-specific category
     date: str            # ISO 8601 string
     title: str
@@ -102,11 +113,101 @@ class Item:
     summary: str = ""
     importance: int = 2  # 1 (low/routine) — 5 (must-read)
     tags: list[str] = field(default_factory=list)
+    source_score: int = 3  # 1 (noise) — 5 (authoritative)
 
     @property
     def uid(self) -> str:
         # Stable id across runs based on source + url
         return hashlib.md5(f"{self.source}|{self.url}".encode()).hexdigest()[:14]
+
+
+# ============================================================
+# SOURCE RELIABILITY DATABASE
+# ============================================================
+#
+# Each source is rated on 4 dimensions:
+#   authority    - Is it official/regulated/professional? (1-5)
+#   precision    - How often are search results actually about Horizon? (0-1)
+#   freshness    - Are the results timely? (1-5)
+#   uniqueness   - Does it find things other sources miss? (1-5)
+#
+# The `base_score` is the composite reliability score (1-5) used as default
+# for source_score on items from this source.
+
+@dataclass
+class SourceProfile:
+    key: str
+    label: str
+    authority: int      # 1-5
+    precision: float    # 0-1
+    freshness: int      # 1-5
+    uniqueness: int     # 1-5
+    base_score: int     # 1-5, derived from above
+    notes: str = ""
+
+
+SOURCE_PROFILES: dict[str, SourceProfile] = {
+    "HKEX": SourceProfile(
+        key="HKEX", label="港交所披露易",
+        authority=5, precision=1.0, freshness=5, uniqueness=5, base_score=5,
+        notes="官方披露平台,100%准确,法律效力。任何地平线的年报/中报/内幕消息/配股/董事变更均在此披露。",
+    ),
+    "36KR": SourceProfile(
+        key="36KR", label="36氪",
+        authority=4, precision=0.80, freshness=4, uniqueness=4, base_score=4,
+        notes="科技商业媒体,有原创深度报道。地平线融资/战略/产品发布常在此首发。",
+    ),
+    "SOHU": SourceProfile(
+        key="SOHU", label="搜狐",
+        authority=3, precision=0.70, freshness=4, uniqueness=3, base_score=3,
+        notes="综合媒体,高频转载专业财经内容。地平线相关文章量大,但部分是转载,需注意原创性。",
+    ),
+    "IYIOU": SourceProfile(
+        key="IYIOU", label="亿欧",
+        authority=4, precision=0.75, freshness=3, uniqueness=4, base_score=4,
+        notes="科技产业媒体,有行业深度分析。地平线作为头部智驾公司常被覆盖。",
+    ),
+    "QQNEWS": SourceProfile(
+        key="QQNEWS", label="腾讯新闻",
+        authority=3, precision=0.65, freshness=4, uniqueness=3, base_score=3,
+        notes="综合新闻平台,偶尔有地平线深度报道,但噪音较大。",
+    ),
+    "WSCN": SourceProfile(
+        key="WSCN", label="华尔街见闻",
+        authority=3, precision=0.60, freshness=3, uniqueness=2, base_score=3,
+        notes="财经快讯平台,但搜索引擎索引质量差。site:搜索命中率低,实际内容存在但难以抓取。",
+    ),
+    "CAIXIN": SourceProfile(
+        key="CAIXIN", label="财新网",
+        authority=5, precision=0.50, freshness=2, uniqueness=3, base_score=3,
+        notes="权威财经媒体,但搜索引擎索引质量差。site:搜索命中率极低,且多为付费墙内容。",
+    ),
+}
+
+SOURCE_EMOJI = {
+    "HKEX": "📋", "36KR": "💼", "SOHU": "📰",
+    "IYIOU": "🔬", "QQNEWS": "📡", "WSCN": "📉", "CAIXIN": "🔍",
+}
+
+
+def get_source_score(source: str) -> int:
+    """Get base reliability score for a source."""
+    profile = SOURCE_PROFILES.get(source)
+    return profile.base_score if profile else 2
+
+
+def score_item_source(item: Item) -> int:
+    """
+    Adjust source_score based on content signals.
+    Items with high importance get a +1 boost (the source is delivering signal).
+    Items with low importance get -1 (routine noise).
+    """
+    base = get_source_score(item.source)
+    if item.importance >= 5:
+        return min(5, base + 1)
+    if item.importance <= 1:
+        return max(1, base - 1)
+    return base
 
 
 # ============================================================
@@ -835,6 +936,30 @@ def fetch_via_ddg(site: str, keywords: list[str], source_label: str,
     return _fetch_news_ddg(site, source_label, max_results=limit)
 
 
+# ============================================================
+# NEW SOURCES (v2) — Added after 2026-06-01 source audit
+# ============================================================
+#
+# SOHU  - sohu.com articles consistently show up in search results
+#         for Horizon Robotics keywords; high volume, mostly reprints
+# IYIOU - iyiou.com / 亿欧 has tech-business coverage of Horizon
+# QQNEWS - news.qq.com occasionally has in-depth Horizon coverage
+
+def fetch_sohu(limit: int = 15) -> list[Item]:
+    """Fetch Horizon Robotics articles from sohu.com via DDG."""
+    return _fetch_news_ddg("sohu.com", "SOHU", max_results=limit)
+
+
+def fetch_iyiou(limit: int = 15) -> list[Item]:
+    """Fetch Horizon Robotics articles from iyiou.com via DDG."""
+    return _fetch_news_ddg("iyiou.com", "IYIOU", max_results=limit)
+
+
+def fetch_qqnews(limit: int = 15) -> list[Item]:
+    """Fetch Horizon Robotics articles from news.qq.com via DDG."""
+    return _fetch_news_ddg("news.qq.com", "QQNEWS", max_results=limit)
+
+
 def _matches_company(text: str) -> bool:
     if not text:
         return False
@@ -915,6 +1040,36 @@ def write_digest(new_items: list[Item], all_items: list[Item],
         lines.append(f"**来源分布**: {breakdown}")
     lines.append("")
 
+    # ─── Source Reliability Assessment ───
+    lines.append("---")
+    lines.append("")
+    lines.append("## 📊 来源可靠性评估")
+    lines.append("")
+    lines.append("| 来源 | 类型 | 权威性 | 精确度 | 时效性 | 独特价值 | 综合可靠性 | 本次产出 |")
+    lines.append("|---|---:|---:|---:|---:|:---:|:---:|")
+    for src_key in ["HKEX", "36KR", "SOHU", "IYIOU", "QQNEWS", "WSCN", "CAIXIN"]:
+        profile = SOURCE_PROFILES.get(src_key)
+        if not profile:
+            continue
+        count = by_source.get(src_key, 0)
+        count_str = f"**{count} 条**" if count > 0 else "0 条"
+        score_bar = "█" * profile.base_score + "░" * (5 - profile.base_score)
+        lines.append(
+            f"| {SOURCE_EMOJI.get(src_key, '📌')} {profile.label} | "
+            f"{profile.notes[:24]}... | "
+            f"{'⭐' * profile.authority} | "
+            f"{profile.precision*100:.0f}% | "
+            f"{'⭐' * profile.freshness} | "
+            f"{'⭐' * profile.uniqueness} | "
+            f"`{score_bar}` {profile.base_score}/5 | "
+            f"{count_str} |"
+        )
+    lines.append("")
+    lines.append("> **评分说明**: 权威性=来源资质(官方/专业媒体/UGC), 精确度=搜索结果中相关占比, "
+                 "时效性=信息更新速度, 独特价值=其他来源未覆盖的独家内容")
+    lines.append("")
+
+    # ─── KPI Signals ───
     signals = extract_kpi_signals(new_items)
     if any(signals.values()):
         lines.append("## ⚡ KPI 信号警报")
@@ -934,6 +1089,7 @@ def write_digest(new_items: list[Item], all_items: list[Item],
                 lines.append(f"  - [{it.title}]({it.url})")
         lines.append("")
 
+    # ─── KPI Baseline ───
     kpi = load_kpi_baseline()
     lines.append("## 📊 当前 KPI 基线")
     lines.append("")
@@ -987,12 +1143,7 @@ def write_digest(new_items: list[Item], all_items: list[Item],
 
 
 def render_item(it: Item) -> list[str]:
-    src_emoji = {
-        "HKEX":   "📋",
-        "WSCN":   "📰",
-        "CAIXIN": "🔍",
-        "36KR":   "💼",
-    }.get(it.source, "📌")
+    src_emoji = SOURCE_EMOJI.get(it.source, "📌")
     date_short = it.date[:10] if it.date else "???"
 
     lines = [f"### {src_emoji} {it.title}"]
@@ -1002,6 +1153,9 @@ def render_item(it: Item) -> list[str]:
         meta.append(f"_{it.category}_")
     if it.tags:
         meta.append("`" + " ".join(it.tags) + "`")
+    # Source reliability score indicator
+    score_bar = "█" * it.source_score + "░" * (5 - it.source_score)
+    meta.append(f"来源可靠度: `{score_bar}` {it.source_score}/5")
     lines.append("　·　".join(meta))
     lines.append("")
     if it.summary:
@@ -1044,14 +1198,24 @@ def cmd_test() -> int:
         results.append(("HKEX (page)", "❌ FAIL", str(e)))
 
     if HAS_DDGS:
-        try:
-            with DDGS() as ddgs:
-                test_results = list(ddgs.text("地平线机器人 site:36kr.com", max_results=3))
-            n = len(test_results)
-            status = "✅ OK" if n > 0 else "⚠️ EMPTY"
-            results.append(("DDG Search", status, f"{n} results"))
-        except Exception as e:
-            results.append(("DDG Search", "❌ FAIL", str(e)))
+        test_sites = [
+            ("36kr", "36Kr"),
+            ("sohu.com", "SOHU"),
+            ("iyiou.com", "IYIOU"),
+            ("news.qq.com", "QQ News"),
+            ("wallstreetcn.com", "WSCN"),
+            ("caixin.com", "CAIXIN"),
+        ]
+        for site, label in test_sites:
+            try:
+                with DDGS() as ddgs:
+                    test_results = list(ddgs.text(
+                        f"地平线机器人 site:{site}", max_results=3))
+                n = len(test_results)
+                status = "✅ OK" if n > 0 else "⚠️ EMPTY"
+                results.append((f"DDG→{label}", status, f"{n} results"))
+            except Exception as e:
+                results.append((f"DDG→{label}", "❌ FAIL", str(e)))
     else:
         results.append(("DDG Search", "❌ NO_LIB", "duckduckgo_search not installed"))
 
@@ -1060,6 +1224,99 @@ def cmd_test() -> int:
     for src, status, detail in results:
         print(f"{src:<16} {status:<14} {detail}")
     print()
+    return 0
+
+
+def cmd_diagnose() -> int:
+    """Source reliability audit — test each source and report quality metrics."""
+    print("\n=== 来源可靠性诊断 ===\n")
+    print("测试每个来源的搜索命中率、相关性和信号质量...\n")
+
+    if not HAS_DDGS:
+        print("❌ duckduckgo_search 未安装, 无法诊断")
+        return 1
+
+    report: list[dict] = []
+
+    test_sources = [
+        ("36kr.com", "36KR"),
+        ("sohu.com", "SOHU"),
+        ("iyiou.com", "IYIOU"),
+        ("news.qq.com", "QQNEWS"),
+        ("wallstreetcn.com", "WSCN"),
+        ("caixin.com", "CAIXIN"),
+    ]
+
+    for site, src_key in test_sources:
+        profile = SOURCE_PROFILES.get(src_key)
+        print(f"  [{src_key}] {profile.label if profile else src_key}...")
+        try:
+            all_results: list[dict] = []
+            with DDGS() as ddgs:
+                for kw in KEYWORDS_CN[:2]:
+                    query = f"site:{site} {kw}"
+                    results = list(ddgs.text(query, max_results=10))
+                    all_results.extend(results)
+                    time.sleep(0.5)
+
+            total = len(all_results)
+            relevant = sum(1 for r in all_results
+                          if _matches_company(r.get("title", "")))
+            on_site = sum(1 for r in all_results
+                         if site in (r.get("href", "") or ""))
+
+            actual_precision = relevant / max(total, 1)
+            signal_count = sum(
+                1 for r in all_results
+                if _matches_company(r.get("title", ""))
+                and score_news(r.get("title", ""), r.get("body", ""))[0] >= 4
+            )
+
+            print(f"    总结果: {total} | 相关: {relevant} | "
+                  f"本站: {on_site} | 高信号: {signal_count} | "
+                  f"精确度: {actual_precision*100:.0f}%")
+
+            report.append({
+                "source": src_key,
+                "label": profile.label if profile else src_key,
+                "total": total,
+                "relevant": relevant,
+                "on_site": on_site,
+                "high_signal": signal_count,
+                "precision": actual_precision,
+                "base_score": profile.base_score if profile else 3,
+            })
+        except Exception as e:
+            print(f"    ❌ FAILED: {e}")
+            report.append({
+                "source": src_key,
+                "label": profile.label if profile else src_key,
+                "total": 0, "relevant": 0, "on_site": 0,
+                "high_signal": 0, "precision": 0,
+                "base_score": 0, "error": str(e),
+            })
+
+    # ─── Summary ───
+    print("\n" + "=" * 60)
+    print("来源可靠性排名\n")
+    ranked = sorted(report, key=lambda x: (
+        x["high_signal"] * 2 + x["relevant"],
+        -abs(x["precision"] - (x.get("base_score", 3) / 5)),
+    ), reverse=True)
+
+    print(f"{'排名':<4} {'来源':<12} {'产出':<6} {'高信号':<6} {'精确度':<8} {'建议':<20}")
+    print("-" * 60)
+    for i, r in enumerate(ranked, 1):
+        rec = "✅ 保留" if r["high_signal"] >= 2 or r["relevant"] >= 5 else (
+            "⚠️ 降权" if r["relevant"] >= 2 else "❌ 考虑移除"
+        )
+        if r.get("error"):
+            rec = "🔧 需修复"
+        print(f"{i:<4} {r['source']:<12} {r['relevant']:<6} "
+              f"{r['high_signal']:<6} {r['precision']*100:.0f}%{'':<4} {rec}")
+
+    print("\n诊断完成。根据结果可调整 SOURCE_PROFILES 中的配置。")
+    print("运行 `python3 horizon_monitor.py --reset --since 180` 进行正式监测。\n")
     return 0
 
 
@@ -1090,27 +1347,48 @@ def cmd_run(args) -> int:
         time.sleep(1)
 
     if not args.no_news:
-        print("[2] 华尔街见闻 (via DDG)…")
-        wscn_items = _safe_fetch("WSCN", _fetch_news_ddg,
-                                 "wallstreetcn.com", "WSCN", 20)
-        print(f"    → {len(wscn_items)} 条")
-        all_items.extend(wscn_items)
-        time.sleep(1)
-
-        print("[3] 财新网 (via DDG)…")
-        cx = _safe_fetch("CAIXIN", _fetch_news_ddg,
-                         "caixin.com", "CAIXIN", 15)
-        print(f"    → {len(cx)} 条")
-        all_items.extend(cx)
-        time.sleep(1)
-
-        print("[4] 36氪 (via DDG)…")
+        print("[2] 36氪 (via DDG)…")
         kr = _safe_fetch("36KR", _fetch_news_ddg,
                          "36kr.com", "36KR", 15)
         print(f"    → {len(kr)} 条")
         all_items.extend(kr)
+        time.sleep(1)
+
+        print("[3] 搜狐 (via DDG)…")
+        sohu_items = _safe_fetch("SOHU", fetch_sohu, 15)
+        print(f"    → {len(sohu_items)} 条")
+        all_items.extend(sohu_items)
+        time.sleep(1)
+
+        print("[4] 亿欧 (via DDG)…")
+        iyiou_items = _safe_fetch("IYIOU", fetch_iyiou, 15)
+        print(f"    → {len(iyiou_items)} 条")
+        all_items.extend(iyiou_items)
+        time.sleep(1)
+
+        print("[5] 腾讯新闻 (via DDG)…")
+        qq_items = _safe_fetch("QQNEWS", fetch_qqnews, 10)
+        print(f"    → {len(qq_items)} 条")
+        all_items.extend(qq_items)
+        time.sleep(1)
+
+        print("[6] 华尔街见闻 (via DDG)…")
+        wscn_items = _safe_fetch("WSCN", _fetch_news_ddg,
+                                 "wallstreetcn.com", "WSCN", 10)
+        print(f"    → {len(wscn_items)} 条")
+        all_items.extend(wscn_items)
+        time.sleep(1)
+
+        print("[7] 财新网 (via DDG)…")
+        cx = _safe_fetch("CAIXIN", _fetch_news_ddg,
+                         "caixin.com", "CAIXIN", 10)
+        print(f"    → {len(cx)} 条")
+        all_items.extend(cx)
 
     all_items = _dedupe(all_items)
+    # Assign source reliability scores
+    for it in all_items:
+        it.source_score = score_item_source(it)
     new_items = [it for it in all_items if it.uid not in seen]
     print(f"[result] new={len(new_items)}　total={len(all_items)}")
 
@@ -1156,6 +1434,7 @@ def main() -> int:
         epilog=(
             "Examples (news/filings monitoring):\n"
             "  python3 horizon_monitor.py --test\n"
+            "  python3 horizon_monitor.py --diagnose\n"
             "  python3 horizon_monitor.py --since 365 --json\n"
             "  python3 horizon_monitor.py --no-news --reset\n"
             "\n"
@@ -1179,6 +1458,8 @@ def main() -> int:
                     help="KPI dashboard output path (default: kpi_dashboard.md)")
     ap.add_argument("--test", action="store_true",
                     help="connectivity test only, no scraping")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="source reliability audit — test & rank all sources")
 
     ap.add_argument("kpi_cmd", nargs="?", default=None,
                     choices=[None, "kpi"],
@@ -1201,6 +1482,8 @@ def main() -> int:
 
     if args.test:
         return cmd_test()
+    if args.diagnose:
+        return cmd_diagnose()
     result = cmd_run(args)
     try:
         render_kpi_dashboard(args.out_kpi)
