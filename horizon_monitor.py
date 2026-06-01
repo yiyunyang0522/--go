@@ -7,9 +7,9 @@ Monitors reliable, high-signal sources for material information about
 Horizon Robotics (地平线机器人, HK:9660):
 
   HKEX        - hkexnews.hk official disclosure portal (filings, announcements)
-  WSCN        - 华尔街见闻 wallstreetcn.com (real-time financial news)
-  Caixin      - 财新网 caixin.com (deep investigative reporting)
-  36Kr        - 36氪 36kr.com (tech ecosystem reporting)
+  WSCN        - DuckDuckGo site search on wallstreetcn.com
+  Caixin      - DuckDuckGo site search on caixin.com
+  36Kr        - DuckDuckGo site search on 36kr.com
 
 EXPLICITLY EXCLUDED, with reasons:
   Bloomberg   - paywall + ToS + near-zero Horizon-specific coverage
@@ -31,7 +31,7 @@ State (which items were already seen) is stored in
 so the next run only flags new items.
 
 DEPENDENCIES
-  pip install requests beautifulsoup4 lxml
+  pip install requests beautifulsoup4 lxml duckduckgo_search
 """
 from __future__ import annotations
 
@@ -53,8 +53,14 @@ try:
 except ImportError:
     sys.exit(
         "Missing dependencies. Run:\n"
-        "    pip install requests beautifulsoup4 lxml"
+        "    pip install requests beautifulsoup4 lxml duckduckgo_search"
     )
+
+try:
+    from duckduckgo_search import DDGS  # type: ignore
+    HAS_DDGS = True
+except ImportError:
+    HAS_DDGS = False
 
 
 # ============================================================
@@ -106,67 +112,39 @@ class Item:
 # ============================================================
 # KPI TRACKING - 核心财务指标跟踪
 # ============================================================
-#
-# This module tracks the financial KPIs that matter most for thesis validation:
-#
-#   1. Gross Margin (overall) - the headline figure
-#   2. Gross Margin - Hardware (Product Solutions) - the most-watched
-#   3. Gross Margin - Software (License & Services) - moat indicator
-#   4. High-end shipment mix % - drives ASP uplift
-#   5. R&D as % of revenue - operating leverage signal
-#   6. Revenue YoY growth
-#   7. Adjusted operating loss (excludes fair value of preferred shares)
-#
-# The baseline is hardcoded with FY2025 actuals. After each new H1/annual
-# report, run `python3 horizon_monitor.py kpi update` to enter new numbers
-# interactively. The script compares to baseline and flags any KPI that
-# crosses a warning threshold.
 
-# Baseline KPI snapshot - update after each new report
-# Last updated: 2026-03 (FY2025 annual report)
 KPI_BASELINE = {
     "as_of": "2025FY",
     "report_date": "2026-03-19",
     "report_url": "https://stockn.xueqiu.com/09660/20260319282482.pdf",
-    # Income statement
     "revenue_cny_mm": 3758,
     "revenue_yoy": 0.577,
-    "gm_overall": 0.645,       # 综合毛利率
-    "gm_hardware": 0.345,      # 汽车产品方案毛利率 - 硬件
-    "gm_software": 0.93,       # 汽车授权服务毛利率 - 软件
-    "gm_nonauto": 0.50,        # 非汽车业务毛利率（估算）
-    "rd_pct_revenue": 1.371,   # 研发费用率 137.1%
+    "gm_overall": 0.645,
+    "gm_hardware": 0.345,
+    "gm_software": 0.93,
+    "gm_nonauto": 0.50,
+    "rd_pct_revenue": 1.371,
     "adj_op_loss_cny_mm": -2372,
-    # Volume / mix
-    "shipments_units_mm": 4.01,           # 全年出货 401 万套
-    "highend_mix": 0.45,                  # 中高阶占比
-    "highend_shipments_units_mm": 1.80,   # 中高阶 180 万套
-    "cumulative_shipments_units_mm": 11.7,  # 累计 1170 万套
-    # Mix
-    "revenue_mix_product": 0.43,          # 硬件占比
-    "revenue_mix_license": 0.52,          # 软件占比
+    "shipments_units_mm": 4.01,
+    "highend_mix": 0.45,
+    "highend_shipments_units_mm": 1.80,
+    "cumulative_shipments_units_mm": 11.7,
+    "revenue_mix_product": 0.43,
+    "revenue_mix_license": 0.52,
     "revenue_mix_nonauto": 0.05,
-    # Market share (China自主品牌)
-    "market_share_l2_adas": 0.477,        # L2 ADAS 市占率
-    "market_share_city_noa": 0.144,       # 城区 NOA 市占率
-    # HSD
-    "hsd_design_wins": 20,                # HSD 累计定点车型数
-    "hsd_deployed_units": 22000,          # HSD 上市后已交付套数
+    "market_share_l2_adas": 0.477,
+    "market_share_city_noa": 0.144,
+    "hsd_design_wins": 20,
+    "hsd_deployed_units": 22000,
 }
 
-# Health thresholds - what's a healthy / warning / danger reading
-# Each tuple: (healthy_value, danger_value, direction)
-#   direction = "higher_better" or "lower_better"
-#
-# CRITICAL: GM thresholds calibrated to current trajectory.
-# Hardware GM is THE most-watched metric per analysis of FY2025 report.
 KPI_THRESHOLDS = {
-    "gm_overall":         (0.65,  0.55,  "higher_better"),  # 综合毛利率
-    "gm_hardware":        (0.38,  0.28,  "higher_better"),  # 硬件毛利率 (key tracker)
-    "gm_software":        (0.92,  0.85,  "higher_better"),  # 软件毛利率 (moat)
-    "revenue_yoy":        (0.50,  0.25,  "higher_better"),  # 营收增速
-    "highend_mix":        (0.55,  0.40,  "higher_better"),  # 中高阶占比
-    "rd_pct_revenue":     (1.00,  1.50,  "lower_better"),   # R&D 费率（降才好）
+    "gm_overall":         (0.65,  0.55,  "higher_better"),
+    "gm_hardware":        (0.38,  0.28,  "higher_better"),
+    "gm_software":        (0.92,  0.85,  "higher_better"),
+    "revenue_yoy":        (0.50,  0.25,  "higher_better"),
+    "highend_mix":        (0.55,  0.40,  "higher_better"),
+    "rd_pct_revenue":     (1.00,  1.50,  "lower_better"),
     "market_share_l2_adas":  (0.45,  0.35,  "higher_better"),
     "market_share_city_noa": (0.18,  0.10,  "higher_better"),
 }
@@ -187,7 +165,6 @@ KPI_HISTORY_FILE = STATE_DIR / "kpi_history.json"
 
 
 def load_kpi_baseline() -> dict:
-    """Load saved KPI baseline if exists, else return hardcoded default."""
     if KPI_BASELINE_FILE.exists():
         try:
             return json.loads(KPI_BASELINE_FILE.read_text())
@@ -218,7 +195,6 @@ def append_kpi_history(kpi: dict) -> None:
 
 
 def score_kpi(value, healthy: float, danger: float, direction: str) -> str:
-    """Return status: GREEN / YELLOW / RED based on value vs thresholds."""
     if value is None:
         return "GRAY"
     if direction == "higher_better":
@@ -227,7 +203,7 @@ def score_kpi(value, healthy: float, danger: float, direction: str) -> str:
         if value <= danger:
             return "RED"
         return "YELLOW"
-    else:  # lower_better
+    else:
         if value <= healthy:
             return "GREEN"
         if value >= danger:
@@ -238,18 +214,12 @@ def score_kpi(value, healthy: float, danger: float, direction: str) -> str:
 # ============================================================
 # KPI SIGNAL EXTRACTION FROM NEWS
 # ============================================================
-#
-# Scan news titles + summaries for mentions of key KPIs.
-# We're NOT extracting numbers (too unreliable from short snippets).
-# Instead, we flag articles likely to update our KPI view.
 
 GM_KEYWORDS = [
-    # Chinese
     "毛利率", "毛利", "gross margin", "gm", "毛利率下滑", "毛利率提升",
     "硬件毛利", "软件毛利", "产品毛利", "授权毛利",
     "结构性下滑", "业务组合", "收入组合",
-    # English
-    "gross margin", "margin compression", "margin expansion", "blended margin",
+    "margin compression", "margin expansion", "blended margin",
 ]
 
 VOLUME_KEYWORDS = [
@@ -265,10 +235,6 @@ OPEX_KEYWORDS = [
 
 
 def extract_kpi_signals(items: list[Item]) -> dict:
-    """
-    Scan recent news for mentions of KPI-relevant keywords.
-    Returns a dict of {kpi_category: [matching items]}.
-    """
     signals = {
         "gross_margin": [],
         "volume_asp":   [],
@@ -286,7 +252,6 @@ def extract_kpi_signals(items: list[Item]) -> dict:
 
 
 def render_kpi_dashboard(path: str = "kpi_dashboard.md") -> None:
-    """Write the KPI dashboard markdown file."""
     kpi = load_kpi_baseline()
     history = load_kpi_history()
 
@@ -335,8 +300,6 @@ def render_kpi_dashboard(path: str = "kpi_dashboard.md") -> None:
         lines.append(f"- **硬件业务** (占营收 {mix_p*100:.0f}%): GM = {gm_h*100:.1f}%　← 关键跟踪")
         lines.append(f"- **软件业务** (占营收 {mix_l*100:.0f}%): GM = {gm_s*100:.1f}%　← 护城河")
         lines.append("")
-
-        # Diagnostic
         spread = gm_s - gm_h
         lines.append(f"软件 vs 硬件 GM 差: **{spread*100:.0f}pp** "
                      f"(差异越大, 业务结构变化对综合 GM 影响越大)")
@@ -351,7 +314,7 @@ def render_kpi_dashboard(path: str = "kpi_dashboard.md") -> None:
     else:
         lines.append("| 期间 | 综合 GM | 硬件 GM | 软件 GM | 高端占比 | 营收 YoY |")
         lines.append("|---|---:|---:|---:|---:|---:|")
-        for snap in history[-10:]:  # last 10
+        for snap in history[-10:]:
             period = snap.get("as_of", "?")
             def f(v):
                 return f"{v*100:.1f}%" if isinstance(v, (int, float)) else "—"
@@ -374,7 +337,6 @@ def render_kpi_dashboard(path: str = "kpi_dashboard.md") -> None:
 
 
 def cmd_kpi_show() -> int:
-    """Print current KPI baseline."""
     kpi = load_kpi_baseline()
     print(f"\n=== Current KPI Baseline ({kpi.get('as_of', '?')}) ===\n")
     for key, label in KPI_LABELS.items():
@@ -398,7 +360,6 @@ def cmd_kpi_show() -> int:
 
 
 def cmd_kpi_update() -> int:
-    """Interactive KPI input. Prompts user for each field."""
     print("\n=== KPI Update - 录入新报告数据 ===")
     print("Enter new values (press Enter to keep current baseline value)\n")
 
@@ -420,7 +381,7 @@ def cmd_kpi_update() -> int:
             v = float(s.rstrip("%"))
             if is_pct and "%" in s:
                 v = v / 100
-            elif is_pct and abs(v) > 5:  # likely entered as percent without %
+            elif is_pct and abs(v) > 5:
                 print(f"    (interpreting {v} as {v}%)")
                 v = v / 100
             return v
@@ -428,7 +389,6 @@ def cmd_kpi_update() -> int:
             print(f"    ⚠ Invalid input '{s}', keeping {cur_str}")
             return cur
 
-    # Period meta
     period = input(f"  报告期间 e.g. 2026H1 [{current.get('as_of')}]: ").strip()
     if period:
         new_kpi["as_of"] = period
@@ -461,7 +421,6 @@ def cmd_kpi_update() -> int:
     new_kpi["market_share_l2_adas"] = prompt("market_share_l2_adas", "L2 ADAS 市占率")
     new_kpi["market_share_city_noa"] = prompt("market_share_city_noa", "城区 NOA 市占率")
 
-    # Diff before save
     print("\n=== 变动概览 ===")
     changes = []
     for key in KPI_THRESHOLDS:
@@ -488,11 +447,9 @@ def cmd_kpi_update() -> int:
         print("已取消")
         return 1
 
-    # Save old baseline to history first
     append_kpi_history(current)
     save_kpi_baseline(new_kpi)
 
-    # Now compare to new thresholds and warn
     print("\n=== 新基线健康状态 ===")
     warnings_found = []
     for key, (healthy, danger, direction) in KPI_THRESHOLDS.items():
@@ -501,7 +458,6 @@ def cmd_kpi_update() -> int:
         label = KPI_LABELS.get(key, key)
         status = score_kpi(value, healthy, danger, direction)
         old_status = score_kpi(old_value, healthy, danger, direction)
-
         marker = {"GREEN": "✓", "YELLOW": "!", "RED": "✗", "GRAY": "?"}[status]
         change = ""
         if status != old_status:
@@ -521,7 +477,6 @@ def cmd_kpi_update() -> int:
 
 
 def cmd_kpi_dashboard(args) -> int:
-    """Generate the KPI dashboard markdown file."""
     path = getattr(args, 'out_kpi', None) or "kpi_dashboard.md"
     render_kpi_dashboard(path)
     print(f"✓ KPI dashboard written to {path}")
@@ -550,175 +505,188 @@ def save_state(seen: set[str]) -> None:
 # SOURCE 1 — HKEX DISCLOSURE PORTAL (PRIMARY)
 # ============================================================
 #
-# This is the single most important source. Every material announcement
-# for an HK-listed company MUST go through this portal first by law.
-#
-# Endpoint: https://www1.hkexnews.hk/search/titleSearchServlet.do
-# Returns: JSON when called with ?lang=EN
-#
-# If HKEX changes their endpoint structure, this is where to debug.
-# Fallback: parse the HTML at https://www1.hkexnews.hk/search/titlesearch.xhtml
+# FIXED (2026-06-01): HKEX requires a 3-step JSF session-based approach.
+# The old code called titleSearchServlet.do directly, which always returns
+# recordCnt=0 without a valid JSF session. The fix:
+#   1. GET titlesearch.xhtml to obtain ViewState + form action
+#   2. POST the JSF form to initialize the session with date range
+#   3. GET titleSearchServlet.do with proper headers to fetch JSON
 
 def fetch_hkex(since_days: int = 365, lang: str = "EN") -> list[Item]:
     end_date = dt.date.today()
     start_date = end_date - dt.timedelta(days=since_days)
+    from_str = start_date.strftime("%Y%m%d")
+    to_str = end_date.strftime("%Y%m%d")
 
-    url = "https://www1.hkexnews.hk/search/titleSearchServlet.do"
-    params = {
-        "sortDir": "0",
-        "sortByOptions": "DateTime",
-        "category": "0",
-        "market": "SEHK",
-        "stockId": HKEX_STOCK_ID,
-        "documentType": "-1",
-        "fromDate": start_date.strftime("%Y%m%d"),
-        "toDate": end_date.strftime("%Y%m%d"),
-        "title": "",
-        "searchType": "1",
-        "t1code": "-2",
-        "t2Gcode": "-2",
-        "t2code": "-2",
-        "rowRange": "100",
-        "lang": lang,
-    }
+    HKEX_BASE = "https://www1.hkexnews.hk"
+    SEARCH_PAGE = f"{HKEX_BASE}/search/titlesearch.xhtml"
+    API_ENDPOINT = f"{HKEX_BASE}/search/titleSearchServlet.do"
 
     items: list[Item] = []
+
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
+        session = requests.Session()
+        session.headers.update(HEADERS)
 
-        # HKEX servlet returns JSON-shaped text but content-type can be text/html.
-        # Strip BOM/whitespace and parse manually.
-        text = r.text.strip().lstrip("\ufeff")
-        # Some responses come wrapped in callback paren — strip if so
-        if text.startswith("(") and text.endswith(")"):
-            text = text[1:-1]
+        # Step 1: GET search page to extract ViewState and form action
+        page_resp = session.get(
+            SEARCH_PAGE,
+            params={
+                "sortDir": "0",
+                "sortByRecordDate": "on",
+                "searchType": "0",
+                "category": "0",
+                "t1code": "-2",
+                "t2Gcode": "-2",
+                "t2code": "-2",
+                "documentType": "-1",
+                "rowRange": "0",
+                "lang": "EN",
+            },
+            timeout=TIMEOUT,
+        )
+        page_resp.raise_for_status()
 
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            # If it's not JSON, dump the first 500 chars so we can see what it is
-            print(f"  [HKEX] response is not JSON. First 500 chars:", file=sys.stderr)
-            print(f"  {text[:500]}", file=sys.stderr)
+        vs_match = re.search(r'javax\.faces\.ViewState.*?value="([^"]+)"', page_resp.text)
+        view_state = vs_match.group(1) if vs_match else ""
+        fa_match = re.search(r'<form[^>]*action="([^"]+)"', page_resp.text)
+        form_action = fa_match.group(1) if fa_match else ""
+
+        if not view_state or not form_action:
+            print("  [HKEX] Could not extract ViewState/form action from search page",
+                  file=sys.stderr)
             return items
 
-        # Unwrap dict if response is wrapped (e.g., {"result": [...]})
-        if isinstance(data, dict):
-            for key in ("result", "data", "results", "items", "records"):
-                if key in data and isinstance(data[key], list):
-                    data = data[key]
-                    break
-            else:
-                # Single dict with no list field — log and bail
-                print(f"  [HKEX] unexpected dict response, keys: {list(data.keys())}",
-                      file=sys.stderr)
-                return items
+        # Step 2: POST form to initialize session with date range
+        submit_url = f"{HKEX_BASE}{form_action}" if form_action.startswith("/") else form_action
+        session.post(
+            submit_url,
+            data={
+                "j_idt10": "j_idt10",
+                "j_idt10:loadMoreRange": "100",
+                "javax.faces.ViewState": view_state,
+                "from": from_str,
+                "to": to_str,
+            },
+            timeout=TIMEOUT,
+        )
 
-        if not isinstance(data, list):
-            print(f"  [HKEX] expected list, got {type(data).__name__}", file=sys.stderr)
-            return items
+        # Step 3: GET JSON API with proper headers
+        api_headers = {
+            **HEADERS,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Referer": SEARCH_PAGE,
+            "X-Requested-With": "XMLHttpRequest",
+        }
 
-        # Multiple field-name conventions HKEX has used over the years:
-        title_keys     = ["TITLE", "title", "DOC_TITLE", "doc_title", "newsTitle"]
-        file_keys      = ["FILE_LINK", "file_link", "fileLink", "DOC_LINK", "doc_link"]
-        category_keys  = ["LONG_TEXT", "long_text", "longText", "CATEGORY", "category", "headLine"]
-        date_keys      = ["DATE_TIME", "date_time", "dateTime", "DATETIME", "RELEASE_TIME", "releaseTime"]
+        all_records: list[dict] = []
+        fetched = 0
+        while True:
+            r = session.get(
+                API_ENDPOINT,
+                params={
+                    "sortDir": "0",
+                    "sortByOptions": "DateTime",
+                    "category": "0",
+                    "market": "SEHK",
+                    "stockId": HKEX_STOCK_ID,
+                    "documentType": "-1",
+                    "fromDate": from_str,
+                    "toDate": to_str,
+                    "title": "",
+                    "searchType": "0",
+                    "t1code": "-2",
+                    "t2Gcode": "-2",
+                    "t2code": "-2",
+                    "rowRange": str(fetched + 5000),
+                    "lang": lang,
+                },
+                headers=api_headers,
+                timeout=TIMEOUT,
+            )
+            r.raise_for_status()
 
-        def get_field(entry: dict, candidates: list[str]) -> str:
-            """Try each candidate key; return first non-empty value."""
-            for k in candidates:
-                if k in entry and entry[k]:
-                    return str(entry[k]).strip()
-            return ""
-
-        skipped = 0
-        for i, entry in enumerate(data):
             try:
-                # Skip non-dict entries (the original bug — sometimes this is a string)
-                if not isinstance(entry, dict):
-                    if i == 0:  # log shape on first occurrence
-                        print(f"  [HKEX] entry not a dict, got {type(entry).__name__}: "
-                              f"{str(entry)[:120]}", file=sys.stderr)
-                    skipped += 1
-                    continue
-
-                title = get_field(entry, title_keys)
-                file_link = get_field(entry, file_keys)
-                cat = get_field(entry, category_keys)
-                date_raw = get_field(entry, date_keys)
-
-                # Skip entries with no title (probably a header row or filter)
-                if not title:
-                    skipped += 1
-                    continue
-
-                full_url = urljoin("https://www1.hkexnews.hk", file_link) if file_link else ""
-
-                # Try several date formats
-                date_iso = date_raw
-                for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S",
-                            "%Y-%m-%d %H:%M", "%d/%m/%Y", "%Y%m%d"):
-                    try:
-                        date_iso = dt.datetime.strptime(date_raw, fmt).isoformat()
-                        break
-                    except ValueError:
-                        continue
-
-                score, tags = score_hkex(title, cat)
-                items.append(Item(
-                    source="HKEX",
-                    category=cat,
-                    date=date_iso,
-                    title=title,
-                    url=full_url,
-                    summary="",
-                    importance=score,
-                    tags=tags,
-                ))
-            except Exception as e:
-                # Don't let a single bad entry kill the whole batch
-                print(f"  [HKEX] entry {i} parse error ({type(e).__name__}): {e}",
+                data = r.json()
+            except json.JSONDecodeError:
+                print(f"  [HKEX] response is not JSON. First 300 chars: {r.text[:300]}",
                       file=sys.stderr)
-                skipped += 1
+                break
 
-        if skipped > 0:
-            print(f"  [HKEX] skipped {skipped} entries (no title or parse error)",
-                  file=sys.stderr)
+            result_raw = data.get("result", "null")
+            if not result_raw or result_raw == "null":
+                break
 
-        if not items and data:
-            # We got data back but couldn't parse any of it — dump shape for diagnosis
-            sample = data[0] if data else None
-            print(f"  [HKEX] could not parse any entry. First entry shape:",
-                  file=sys.stderr)
-            print(f"  type={type(sample).__name__}  preview={str(sample)[:300]}",
-                  file=sys.stderr)
-            if isinstance(sample, dict):
-                print(f"  keys={list(sample.keys())}", file=sys.stderr)
+            if isinstance(result_raw, str):
+                records = json.loads(result_raw)
+            else:
+                records = result_raw
+
+            if not records:
+                break
+
+            has_next = data.get("hasNextRow", False)
+            new_records = records[fetched:] if fetched < len(records) else []
+            all_records.extend(new_records)
+            fetched = len(records)
+
+            if not has_next:
+                break
+
+            time.sleep(0.3)
+
+        for entry in all_records:
+            if not isinstance(entry, dict):
+                continue
+            title = (entry.get("TITLE") or entry.get("title") or "").strip()
+            if not title:
+                continue
+            title = re.sub(r"<[^>]+>", " ", title)
+            title = " ".join(title.split())
+            file_link = entry.get("FILE_LINK", "") or entry.get("file_link", "")
+            cat = (entry.get("LONG_TEXT") or entry.get("long_text") or
+                   entry.get("SHORT_TEXT") or entry.get("short_text") or "").strip()
+            cat = re.sub(r"<[^>]+>", " ", cat)[:120]
+            date_raw = (entry.get("DATE_TIME") or entry.get("date_time") or "").strip()
+            full_url = f"{HKEX_BASE}{file_link}" if file_link else ""
+
+            date_iso = date_raw
+            for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S",
+                        "%Y-%m-%d %H:%M", "%d/%m/%Y", "%Y%m%d"):
+                try:
+                    date_iso = dt.datetime.strptime(date_raw, fmt).isoformat()
+                    break
+                except ValueError:
+                    continue
+
+            score, tags = score_hkex(title, cat)
+            items.append(Item(
+                source="HKEX",
+                category=cat,
+                date=date_iso,
+                title=title,
+                url=full_url,
+                summary="",
+                importance=score,
+                tags=tags,
+            ))
+
+        print(f"  [HKEX] lang={lang} → {len(all_records)} raw records, {len(items)} parsed",
+              file=sys.stderr)
 
     except requests.RequestException as e:
         print(f"  [HKEX] fetch failed: {type(e).__name__}: {e}", file=sys.stderr)
         if lang == "EN":
             print("  [HKEX] retrying with Chinese...", file=sys.stderr)
             return fetch_hkex(since_days=since_days, lang="ZH")
+
     return items
 
 
 def score_hkex(title: str, category: str) -> tuple[int, list[str]]:
-    """
-    Importance scoring for HKEX disclosures.
-
-    5 = must read (annual/interim report, profit alert, major contracts,
-        material acquisitions/disposals, financing >5% of cap)
-    4 = high (strategic transactions, share placements, JV announcements,
-        material updates)
-    3 = medium (routine announcements with substantive content)
-    2 = default
-    1 = noise (monthly returns, proxy forms, list of directors)
-    """
     text = f"{title} {category}".lower()
     tags: list[str] = []
 
-    # === HIGH-PRIORITY (importance 5) ===
     high5_patterns = [
         ("annual report", "annual_report"),
         ("interim report", "interim_report"),
@@ -739,7 +707,6 @@ def score_hkex(title: str, category: str) -> tuple[int, list[str]]:
             tags.append(tag)
             return 5, tags
 
-    # === HIGH (importance 4) ===
     high4_patterns = [
         ("placing", "financing"),
         ("subscription", "financing"),
@@ -764,7 +731,6 @@ def score_hkex(title: str, category: str) -> tuple[int, list[str]]:
             tags.append(tag)
             return 4, tags
 
-    # === MEDIUM (importance 3) ===
     med_patterns = [
         ("share award", "incentive"),
         ("share option", "incentive"),
@@ -785,7 +751,6 @@ def score_hkex(title: str, category: str) -> tuple[int, list[str]]:
             tags.append(tag)
             return 3, tags
 
-    # === LOW (importance 1) ===
     low_patterns = [
         "monthly return",
         "next day disclosure",
@@ -803,119 +768,71 @@ def score_hkex(title: str, category: str) -> tuple[int, list[str]]:
 
 
 # ============================================================
-# SOURCE 2 — 华尔街见闻 (WALL STREET INSIGHTS)
+# SOURCE 2/3/4 — NEWS via DuckDuckGo Search (unified)
 # ============================================================
 #
-# Public search API exists at api.wallstcn.com.
-# No auth required for search; auth required for full premium articles.
+# FIXED (2026-06-01): Replaced broken wallstreetcn API and DDG HTML scraping
+# with the duckduckgo_search Python library. This library uses DDG's non-JS
+# lite API, which is much more reliable than raw HTML POST requests.
+#
+# All three news sources (WSCN, Caixin, 36Kr) now use the same function.
 
-def fetch_wallstreetcn(keyword: str, limit: int = 20) -> list[Item]:
-    api = "https://api.wallstcn.com/apiv1/search/articles"
-    params = {
-        "keyword": keyword,
-        "limit": limit,
-    }
+def _fetch_news_ddg(site: str, source_label: str,
+                    max_results: int = 15) -> list[Item]:
+    """Fetch news from a site using DuckDuckGo text search (duckduckgo_search lib)."""
     items: list[Item] = []
+    if not HAS_DDGS:
+        print(f"  [{source_label}] duckduckgo_search not installed, skipping",
+              file=sys.stderr)
+        return items
+
     try:
-        r = requests.get(api, params=params, headers=HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        articles = (
-            data.get("data", {}).get("items")
-            or data.get("data", {}).get("results")
-            or []
-        )
-        for art in articles:
-            title = (art.get("title") or "").strip()
-            if not title or not _matches_company(title):
-                continue
-            uri = art.get("uri") or art.get("url") or ""
-            aid = art.get("id") or ""
-            full_url = (
-                uri if uri.startswith("http")
-                else f"https://wallstreetcn.com/articles/{aid}"
-            )
-            ts = art.get("display_time") or art.get("created_at") or 0
-            if isinstance(ts, (int, float)) and ts > 0:
-                date_iso = dt.datetime.fromtimestamp(int(ts)).isoformat()
-            else:
-                date_iso = str(ts)
-
-            summary = (art.get("content_short") or art.get("summary") or "")[:240]
-            score, tags = score_news(title, summary)
-
-            items.append(Item(
-                source="WSCN",
-                category="新闻",
-                date=date_iso,
-                title=title,
-                url=full_url,
-                summary=summary,
-                importance=score,
-                tags=tags,
-            ))
-    except (requests.RequestException, json.JSONDecodeError) as e:
-        print(f"  [WSCN] fetch failed: {type(e).__name__}: {e}", file=sys.stderr)
+        with DDGS() as ddgs:
+            for kw in KEYWORDS_CN[:2]:
+                query = f"site:{site} {kw}"
+                try:
+                    results = list(ddgs.text(query, max_results=max_results))
+                    for r in results:
+                        title = (r.get("title") or "").strip()
+                        href = r.get("href") or ""
+                        if not title or not href:
+                            continue
+                        if site not in href:
+                            continue
+                        if not _matches_company(title):
+                            continue
+                        body = (r.get("body") or "")[:240]
+                        date_str = r.get("date", "")
+                        score, tags = score_news(title, body)
+                        items.append(Item(
+                            source=source_label,
+                            category="新闻",
+                            date=date_str or dt.date.today().isoformat(),
+                            title=title,
+                            url=href,
+                            summary=body,
+                            importance=score,
+                            tags=tags,
+                        ))
+                except Exception as e:
+                    print(f"  [{source_label}] DDG error for query '{query}': "
+                          f"{type(e).__name__}: {e}", file=sys.stderr)
+                time.sleep(0.5)
+    except Exception as e:
+        print(f"  [{source_label}] fetch failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
     return items
 
 
-# ============================================================
-# SOURCE 3 — 财新网 (CAIXIN) via Google site search fallback
-# ============================================================
-#
-# Caixin doesn't expose a public search API. We use DuckDuckGo HTML
-# (no API key needed) with a site: filter — gets us recent indexed
-# articles. Result quality is good for cn.caixin.com and 36kr.com.
+def fetch_wallstreetcn(keyword: str = "", limit: int = 20) -> list[Item]:
+    """Search wallstreetcn.com via DDG. (keyword/limit kept for API compat, ignored)"""
+    return _fetch_news_ddg("wallstreetcn.com", "WSCN", max_results=limit)
+
 
 def fetch_via_ddg(site: str, keywords: list[str], source_label: str,
                   limit: int = 10) -> list[Item]:
-    items: list[Item] = []
-    base = "https://duckduckgo.com/html/"
-    for kw in keywords[:2]:  # cap to avoid rate-limiting
-        q = f"site:{site} {kw}"
-        try:
-            r = requests.post(
-                base,
-                data={"q": q},
-                headers=HEADERS,
-                timeout=TIMEOUT,
-            )
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml")
-            for result in soup.select(".result")[:limit]:
-                a = result.select_one(".result__title a") or result.select_one("a.result__a")
-                snippet_el = result.select_one(".result__snippet")
-                if not a:
-                    continue
-                title = a.get_text(strip=True)
-                href = a.get("href", "")
-                # DDG may return redirect URLs; extract the real one
-                m = re.search(r"uddg=([^&]+)", href)
-                if m:
-                    from urllib.parse import unquote
-                    href = unquote(m.group(1))
-                if site not in href:
-                    continue
-                if not _matches_company(title):
-                    continue
-                summary = snippet_el.get_text(" ", strip=True) if snippet_el else ""
-                score, tags = score_news(title, summary)
-                items.append(Item(
-                    source=source_label,
-                    category="新闻",
-                    date=dt.date.today().isoformat(),  # DDG doesn't expose date
-                    title=title,
-                    url=href,
-                    summary=summary,
-                    importance=score,
-                    tags=tags,
-                ))
-            time.sleep(1.5)  # be polite
-        except requests.RequestException as e:
-            print(f"  [{source_label}] fetch failed: {type(e).__name__}: {e}",
-                  file=sys.stderr)
-            break
-    return items
+    """Search via DDG. (keywords kept for API compat, ignored)"""
+    return _fetch_news_ddg(site, source_label, max_results=limit)
 
 
 def _matches_company(text: str) -> bool:
@@ -932,9 +849,6 @@ def score_news(title: str, summary: str = "") -> tuple[int, list[str]]:
     text = f"{title} {summary}".lower()
     tags: list[str] = []
 
-    # 5 — material event (earnings, gross margin specifically, etc.)
-    # NOTE: 毛利率 elevated to importance 5 because it's our core tracker.
-    # Mentions of "毛利率下滑", "硬件毛利", etc. are MUST-READs.
     high5 = {
         "财报": "earnings", "业绩": "earnings", "营收": "earnings", "亏损": "earnings",
         "盈利": "earnings", "利润": "earnings",
@@ -950,7 +864,6 @@ def score_news(title: str, summary: str = "") -> tuple[int, list[str]]:
             tags.append(t)
             return 5, tags
 
-    # 4 — strategic / transaction
     high4 = {
         "中标": "contract", "定点": "contract", "签约": "contract",
         "合作": "partnership", "牵手": "partnership",
@@ -961,7 +874,6 @@ def score_news(title: str, summary: str = "") -> tuple[int, list[str]]:
         "HSD": "hsd", "城区": "city_noa", "NOA": "noa",
         "J6": "chip", "征程": "chip", "Journey": "chip",
         "大众": "vw", "Volkswagen": "vw", "酷睿程": "vw", "CARIZON": "vw",
-        # NEW: KPI-relevant secondary signals
         "中高阶": "highend_mix", "占比": "mix_signal",
         "ASP": "asp", "单价": "asp", "平均售价": "asp",
         "研发费用": "rd_spend", "费用率": "opex_ratio",
@@ -971,7 +883,6 @@ def score_news(title: str, summary: str = "") -> tuple[int, list[str]]:
             tags.append(t)
             return 4, tags
 
-    # 3 — substantive but not material
     if any(k in text for k in ["进展", "更新", "升级", "扩张", "新增"]):
         return 3, tags
 
@@ -986,12 +897,10 @@ def write_digest(new_items: list[Item], all_items: list[Item],
                  since_days: int, path: str = DEFAULT_DIGEST) -> None:
     today = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Sort: highest importance first, then most recent
     def sort_key(it: Item):
         return (-it.importance, it.date)
     new_items = sorted(new_items, key=sort_key)
 
-    # By source for the summary
     by_source: dict[str, int] = {}
     for it in new_items:
         by_source[it.source] = by_source.get(it.source, 0) + 1
@@ -1006,8 +915,6 @@ def write_digest(new_items: list[Item], all_items: list[Item],
         lines.append(f"**来源分布**: {breakdown}")
     lines.append("")
 
-    # === KPI SIGNAL BANNER ===
-    # Highlight any new items that touch our core KPIs (gross margin, etc.)
     signals = extract_kpi_signals(new_items)
     if any(signals.values()):
         lines.append("## ⚡ KPI 信号警报")
@@ -1027,7 +934,6 @@ def write_digest(new_items: list[Item], all_items: list[Item],
                 lines.append(f"  - [{it.title}]({it.url})")
         lines.append("")
 
-    # KPI baseline summary
     kpi = load_kpi_baseline()
     lines.append("## 📊 当前 KPI 基线")
     lines.append("")
@@ -1035,7 +941,6 @@ def write_digest(new_items: list[Item], all_items: list[Item],
     gm_h = kpi.get("gm_hardware")
     gm_s = kpi.get("gm_software")
     if all(v is not None for v in [gm_o, gm_h, gm_s]):
-        # Color code based on hardware GM (the key metric)
         hw_healthy, hw_danger, _ = KPI_THRESHOLDS["gm_hardware"]
         hw_status = score_kpi(gm_h, hw_healthy, hw_danger, "higher_better")
         emoji = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴", "GRAY": "⚪"}[hw_status]
@@ -1100,7 +1005,6 @@ def render_item(it: Item) -> list[str]:
     lines.append("　·　".join(meta))
     lines.append("")
     if it.summary:
-        # Quote the summary, trim to single paragraph
         clean = re.sub(r"\s+", " ", it.summary).strip()
         lines.append(f"> {clean}")
         lines.append("")
@@ -1121,58 +1025,41 @@ def cmd_test() -> int:
     print("Testing endpoints…\n")
     results: list[tuple[str, str, str]] = []
 
-    # HKEX
     try:
         r = requests.get(
-            "https://www1.hkexnews.hk/search/titleSearchServlet.do",
-            params={
-                "sortDir": "0", "sortByOptions": "DateTime",
-                "category": "0", "market": "SEHK",
-                "stockId": HKEX_STOCK_ID,
-                "documentType": "-1",
-                "fromDate": (dt.date.today() - dt.timedelta(days=30)).strftime("%Y%m%d"),
-                "toDate": dt.date.today().strftime("%Y%m%d"),
-                "title": "", "searchType": "1",
-                "t1code": "-2", "t2Gcode": "-2", "t2code": "-2",
-                "rowRange": "10", "lang": "EN",
-            },
+            "https://www1.hkexnews.hk/search/titlesearch.xhtml",
+            params={"lang": "EN"},
             headers=HEADERS, timeout=TIMEOUT,
         )
-        results.append(("HKEX", "✅ OK" if r.status_code == 200 else f"⚠️ HTTP {r.status_code}",
-                        f"{len(r.text)} bytes"))
+        status = "✅ OK" if r.status_code == 200 else f"⚠️ HTTP {r.status_code}"
+        has_vs = "javax.faces.ViewState" in r.text
+        detail = f"{len(r.text)} bytes"
+        if has_vs:
+            detail += ", ViewState found"
+        else:
+            detail += ", NO ViewState"
+            status = "⚠️ NO_VS" if r.status_code == 200 else status
+        results.append(("HKEX (page)", status, detail))
     except Exception as e:
-        results.append(("HKEX", "❌ FAIL", str(e)))
+        results.append(("HKEX (page)", "❌ FAIL", str(e)))
 
-    # WSCN
-    try:
-        r = requests.get(
-            "https://api.wallstcn.com/apiv1/search/articles",
-            params={"keyword": "地平线机器人", "limit": 5},
-            headers=HEADERS, timeout=TIMEOUT,
-        )
-        results.append(("WSCN", "✅ OK" if r.status_code == 200 else f"⚠️ HTTP {r.status_code}",
-                        f"{len(r.text)} bytes"))
-    except Exception as e:
-        results.append(("WSCN", "❌ FAIL", str(e)))
+    if HAS_DDGS:
+        try:
+            with DDGS() as ddgs:
+                test_results = list(ddgs.text("地平线机器人 site:36kr.com", max_results=3))
+            n = len(test_results)
+            status = "✅ OK" if n > 0 else "⚠️ EMPTY"
+            results.append(("DDG Search", status, f"{n} results"))
+        except Exception as e:
+            results.append(("DDG Search", "❌ FAIL", str(e)))
+    else:
+        results.append(("DDG Search", "❌ NO_LIB", "duckduckgo_search not installed"))
 
-    # DDG (used by Caixin/36Kr)
-    try:
-        r = requests.post(
-            "https://duckduckgo.com/html/",
-            data={"q": "site:caixin.com 地平线"},
-            headers=HEADERS, timeout=TIMEOUT,
-        )
-        results.append(("DuckDuckGo", "✅ OK" if r.status_code == 200 else f"⚠️ HTTP {r.status_code}",
-                        f"{len(r.text)} bytes"))
-    except Exception as e:
-        results.append(("DuckDuckGo", "❌ FAIL", str(e)))
-
-    print(f"{'Source':<14} {'Status':<14} {'Detail'}")
+    print(f"{'Source':<16} {'Status':<14} {'Detail'}")
     print("-" * 60)
     for src, status, detail in results:
-        print(f"{src:<14} {status:<14} {detail}")
+        print(f"{src:<16} {status:<14} {detail}")
     print()
-    print("If a source fails, the corresponding scraper will be skipped on `run`.")
     return 0
 
 
@@ -1187,7 +1074,6 @@ def cmd_run(args) -> int:
     all_items: list[Item] = []
 
     def _safe_fetch(label: str, fn, *fargs, **fkwargs) -> list[Item]:
-        """Call a fetch function, log any uncaught error, return [] on failure."""
         try:
             return fn(*fargs, **fkwargs)
         except Exception as e:
@@ -1204,26 +1090,23 @@ def cmd_run(args) -> int:
         time.sleep(1)
 
     if not args.no_news:
-        print("[2] 华尔街见闻…")
-        wscn_items: list[Item] = []
-        for kw in ["地平线机器人", "9660.HK", "Horizon Robotics"]:
-            chunk = _safe_fetch("WSCN", fetch_wallstreetcn, keyword=kw, limit=20)
-            wscn_items.extend(chunk)
-            time.sleep(1.2)
-        wscn_items = _dedupe(wscn_items)
-        print(f"    → {len(wscn_items)} 条 (去重后)")
+        print("[2] 华尔街见闻 (via DDG)…")
+        wscn_items = _safe_fetch("WSCN", _fetch_news_ddg,
+                                 "wallstreetcn.com", "WSCN", 20)
+        print(f"    → {len(wscn_items)} 条")
         all_items.extend(wscn_items)
+        time.sleep(1)
 
-        print("[3] 财新网…")
-        cx = _safe_fetch("CAIXIN", fetch_via_ddg,
-                         "caixin.com", ["地平线机器人", "9660.HK"], "CAIXIN", limit=10)
+        print("[3] 财新网 (via DDG)…")
+        cx = _safe_fetch("CAIXIN", _fetch_news_ddg,
+                         "caixin.com", "CAIXIN", 15)
         print(f"    → {len(cx)} 条")
         all_items.extend(cx)
-        time.sleep(2)
+        time.sleep(1)
 
-        print("[4] 36氪…")
-        kr = _safe_fetch("36KR", fetch_via_ddg,
-                         "36kr.com", ["地平线机器人"], "36KR", limit=10)
+        print("[4] 36氪 (via DDG)…")
+        kr = _safe_fetch("36KR", _fetch_news_ddg,
+                         "36kr.com", "36KR", 15)
         print(f"    → {len(kr)} 条")
         all_items.extend(kr)
 
@@ -1297,7 +1180,6 @@ def main() -> int:
     ap.add_argument("--test", action="store_true",
                     help="connectivity test only, no scraping")
 
-    # KPI subcommand (positional, optional)
     ap.add_argument("kpi_cmd", nargs="?", default=None,
                     choices=[None, "kpi"],
                     help="run KPI subcommand (use 'kpi' followed by show/update/dashboard)")
@@ -1307,7 +1189,6 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    # KPI subcommand dispatch
     if args.kpi_cmd == "kpi":
         if args.kpi_action == "show":
             return cmd_kpi_show()
@@ -1321,7 +1202,6 @@ def main() -> int:
     if args.test:
         return cmd_test()
     result = cmd_run(args)
-    # Also regenerate the KPI dashboard each run (so it stays fresh)
     try:
         render_kpi_dashboard(args.out_kpi)
         print(f"[output] {args.out_kpi}")
